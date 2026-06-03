@@ -1,0 +1,76 @@
+<!--
+  Plan Reviewer 持续工作流面板。
+
+  职责说明：
+  本页面是需求澄清和计划草案审阅的统一工作台。用户只需要打开一次 `/session/{id}`
+  地址，之后 Codex 通过 MCP 工具把下一轮问题或草案写回同一个 session；浏览器端
+  轮询本地 API 并自动切换“等待 Codex”“回答问题”“批注草案”“计划通过”等状态。
+
+  安全说明：
+  页面只加载同源 localhost 静态资源，不引用外部脚本或字体。所有来自状态文件的
+  用户可见文本均由 session.js 转义或用 textContent 写入 DOM，避免 XSS。
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plan Reviewer - 工作流</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar session-topbar">
+      <div class="session-brand">
+        <button class="hamburger-button" type="button" aria-label="菜单">
+          <span></span>
+          <span></span>
+          <span></span>
+        </button>
+        <p class="eyebrow">Plan Reviewer</p>
+        <span class="topbar-divider" aria-hidden="true"></span>
+        <h1 id="sessionTitle">持续工作流</h1>
+      </div>
+      <div class="session-topbar-actions">
+        <button id="reloadButton" class="topbar-ghost-button" type="button">刷新</button>
+        <span id="sessionIdLabel" class="session-id-label">会话 ID: -</span>
+        <span id="sessionStatus" class="status-badge">Loading</span>
+      </div>
+    </header>
+
+    <main class="session-workspace">
+      <aside class="session-sidebar" aria-label="工作流上下文">
+        <section class="session-card">
+          <h2>原始需求摘要</h2>
+          <div id="originalRequest" class="context-block">正在加载...</div>
+        </section>
+
+        <section class="session-card session-timeline-card">
+          <div class="section-heading">
+            <h2>审阅流程</h2>
+            <span id="timelineCount">0</span>
+          </div>
+          <div id="timelineList" class="session-timeline"></div>
+        </section>
+      </aside>
+
+      <section class="session-center" aria-label="当前内容">
+        <div class="document-toolbar">
+          <span id="activeStepLabel">当前步骤</span>
+        </div>
+        <article id="currentContent" class="session-main-card"></article>
+      </section>
+
+      <aside id="actionPane" class="session-action-pane" aria-label="当前操作"></aside>
+    </main>
+
+    <div id="alertOverlay" class="alert-overlay" hidden>
+      <section class="alert-dialog" role="alert" aria-live="assertive" aria-labelledby="alertTitle" aria-describedby="alertMessage">
+        <h2 id="alertTitle">提示</h2>
+        <p id="alertMessage"></p>
+        <button id="alertCloseButton" type="button">知道了</button>
+      </section>
+    </div>
+
+    <script type="module" src="/session.js"></script>
+  </body>
+</html>

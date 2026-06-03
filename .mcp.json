@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "plan_reviewer": {
+      "command": "python3",
+      "args": [
+        "scripts/plan_reviewer_mcp.py"
+      ],
+      "cwd": ".",
+      "tool_timeout_sec": 900
+    }
+  }
+}

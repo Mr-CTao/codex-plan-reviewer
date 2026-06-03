@@ -1,0 +1,76 @@
+<!--
+  Plan Reviewer 本地批注面板。
+
+  职责说明：
+  本文件提供浏览器端结构骨架，具体数据加载、Markdown 渲染和批注提交逻辑位于
+  app.js，视觉布局位于 styles.css。页面只通过 localhost API 读取当前审阅记录，
+  不连接外部网络，避免计划草案泄露到第三方资源。
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plan Reviewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Plan Reviewer</p>
+        <h1 id="reviewTitle">计划草案审阅</h1>
+      </div>
+      <div class="status-wrap">
+        <span id="reviewStatus" class="status-badge">Loading</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="document-pane" aria-label="计划草案">
+        <div class="document-toolbar">
+          <span id="iterationLabel">Draft</span>
+          <button id="reloadButton" type="button">刷新</button>
+        </div>
+        <article id="planDocument" class="plan-document"></article>
+      </section>
+
+      <aside class="review-pane" aria-label="批注区域">
+        <section class="selected-card">
+          <h2>当前选区</h2>
+          <p id="selectionPreview" class="selection-preview">在左侧选中文字或点击段落后添加批注。</p>
+          <textarea id="commentInput" rows="4" placeholder="写下这段计划需要调整的地方"></textarea>
+          <button id="addAnnotationButton" type="button">添加批注</button>
+        </section>
+
+        <section class="annotation-card">
+          <div class="section-heading">
+            <h2>待提交批注</h2>
+            <span id="annotationCount">0</span>
+          </div>
+          <div id="annotationList" class="annotation-list"></div>
+        </section>
+
+        <section class="general-card">
+          <h2>整体意见</h2>
+          <textarea id="generalNoteInput" rows="5" placeholder="例如：范围太大、顺序不合理、缺少验证步骤"></textarea>
+        </section>
+
+        <div class="actions">
+          <button id="submitFeedbackButton" class="primary" type="button">提交批注</button>
+          <button id="approveButton" class="success" type="button">通过计划</button>
+        </div>
+        <p id="messageBox" class="message-box" role="status"></p>
+      </aside>
+    </main>
+
+    <div id="alertOverlay" class="alert-overlay" hidden>
+      <section class="alert-dialog" role="alert" aria-live="assertive" aria-labelledby="alertTitle" aria-describedby="alertMessage">
+        <h2 id="alertTitle">提示</h2>
+        <p id="alertMessage"></p>
+        <button id="alertCloseButton" type="button">知道了</button>
+      </section>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

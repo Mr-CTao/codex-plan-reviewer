@@ -1,0 +1,83 @@
+<!--
+  Plan Reviewer 需求澄清面板。
+
+  职责说明：
+  本文件提供“正式计划草案前”的单轮需求澄清页面结构。页面只通过 localhost API
+  读取当前问题并提交用户回答；每次只处理一个问题，Codex 读取回答后决定继续追问
+  还是进入计划草案审阅。
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plan Reviewer - 需求澄清</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Plan Reviewer</p>
+        <h1 id="clarificationTitle">需求澄清</h1>
+      </div>
+      <div class="status-wrap">
+        <span id="clarificationStatus" class="status-badge">Loading</span>
+      </div>
+    </header>
+
+    <main class="clarify-workspace">
+      <section class="clarify-card" aria-label="需求澄清问题">
+        <div class="clarify-meta">
+          <span id="confidenceTarget">95% 理解目标</span>
+          <button id="reloadButton" type="button">刷新</button>
+        </div>
+
+        <div class="clarify-layout">
+          <aside class="clarify-context-pane" aria-label="当前上下文">
+            <section id="contextSection" class="clarify-section" hidden>
+              <h2>当前上下文</h2>
+              <div id="contextText" class="context-block"></div>
+            </section>
+          </aside>
+
+          <section class="clarify-answer-pane" aria-label="当前问题与回答">
+            <section class="clarify-section">
+              <h2>当前问题</h2>
+              <p id="questionText" class="question-text">正在加载问题...</p>
+            </section>
+
+            <form id="answerForm" class="answer-form">
+              <div id="optionList" class="option-list"></div>
+
+              <label id="freeformGroup" class="freeform-group" hidden>
+                <span id="freeformLabel">D: 其他</span>
+                <textarea id="freeformInput" rows="5" placeholder="输入你自己的意见"></textarea>
+              </label>
+
+              <div id="answerSummary" class="answer-summary" hidden></div>
+
+              <div class="clarify-submit-bar">
+                <div class="clarify-submit-message">
+                  <p id="messageBox" class="message-box" role="status"></p>
+                </div>
+                <div class="clarify-actions">
+                  <button id="submitAnswerButton" class="primary" type="submit">提交回答</button>
+                </div>
+              </div>
+            </form>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="alertOverlay" class="alert-overlay" hidden>
+      <section class="alert-dialog" role="alert" aria-live="assertive" aria-labelledby="alertTitle" aria-describedby="alertMessage">
+        <h2 id="alertTitle">提示</h2>
+        <p id="alertMessage"></p>
+        <button id="alertCloseButton" type="button">知道了</button>
+      </section>
+    </div>
+
+    <script type="module" src="/clarify.js"></script>
+  </body>
+</html>
