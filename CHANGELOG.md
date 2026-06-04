@@ -7,6 +7,7 @@
 - 新增 `.mcp.windows.json`，提供 Windows Codex App 的 MCP 启动配置示例。
 - README 和贡献说明补充 Windows 安装、PowerShell 验证和状态文件路径说明。
 - Skill 兜底流程补充 Windows PowerShell 命令。
+- Session、Review 与 Clarify 面板新增标签页 heartbeat/release，关闭网页后只清理当前 MCP 进程启动的 HTTP 面板服务。
 
 ### Changed
 

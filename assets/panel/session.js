@@ -25,12 +25,16 @@ const state = {
   generalNote: "",
   busy: false,
   message: "",
+  clientId: "",
   pollTimerId: null,
+  heartbeatTimerId: null,
+  releasedClient: false,
   alertTimerId: null,
   lastFocusedElement: null,
 };
 
 const POLL_INTERVAL_MS = 1000;
+const CLIENT_HEARTBEAT_INTERVAL_MS = 10000;
 const ALERT_AUTO_CLOSE_MS = 3000;
 const FREEFORM_OPTION_LABEL = "D";
 const ANNOTATION_HIGHLIGHT_MAX_LENGTH = 280;
@@ -60,9 +64,11 @@ const dom = {
  */
 async function init() {
   state.sessionId = extractSessionId(window.location.pathname);
+  state.clientId = createSessionClientId();
   bindEvents();
   await loadSession({ force: true });
   startPolling();
+  startSessionHeartbeat();
 }
 
 /**
@@ -90,7 +96,8 @@ function bindEvents() {
   dom.alertCloseButton.addEventListener("click", () => hideAlert());
   dom.alertOverlay.addEventListener("click", handleAlertOverlayClick);
   document.addEventListener("keydown", handleGlobalKeydown);
-  window.addEventListener("beforeunload", stopPolling);
+  window.addEventListener("pagehide", handlePageClose);
+  window.addEventListener("beforeunload", handlePageClose);
 }
 
 /**
@@ -117,6 +124,81 @@ function stopPolling() {
     window.clearInterval(state.pollTimerId);
     state.pollTimerId = null;
   }
+}
+
+/**
+ * 启动当前标签页的 Session heartbeat。
+ *
+ * @returns {void}
+ */
+function startSessionHeartbeat() {
+  stopSessionHeartbeat();
+  state.releasedClient = false;
+  sendSessionHeartbeat().catch(() => {});
+  state.heartbeatTimerId = window.setInterval(() => {
+    sendSessionHeartbeat().catch(() => {});
+  }, CLIENT_HEARTBEAT_INTERVAL_MS);
+}
+
+/**
+ * 停止 Session heartbeat 定时器。
+ *
+ * @returns {void}
+ */
+function stopSessionHeartbeat() {
+  if (state.heartbeatTimerId) {
+    window.clearInterval(state.heartbeatTimerId);
+    state.heartbeatTimerId = null;
+  }
+}
+
+/**
+ * 页面关闭或跳转时释放当前标签页租约。
+ *
+ * @returns {void}
+ */
+function handlePageClose() {
+  stopPolling();
+  stopSessionHeartbeat();
+  releaseSessionClient();
+}
+
+/**
+ * 通知当前 HTTP 面板进程本标签页仍处于打开状态。
+ *
+ * @returns {Promise<void>} heartbeat 请求完成后返回。
+ */
+async function sendSessionHeartbeat() {
+  await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/client-heartbeat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clientId: state.clientId }),
+    keepalive: true,
+  });
+}
+
+/**
+ * 通知当前 HTTP 面板进程本标签页已经关闭。
+ *
+ * @returns {void}
+ */
+function releaseSessionClient() {
+  if (state.releasedClient || !state.sessionId || !state.clientId) {
+    return;
+  }
+  state.releasedClient = true;
+  const payload = JSON.stringify({ clientId: state.clientId });
+  const url = `/api/sessions/${encodeURIComponent(state.sessionId)}/client-release`;
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(url, new Blob([payload], { type: "application/json" }));
+    return;
+  }
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload,
+    keepalive: true,
+  }).catch(() => {});
 }
 
 /**
@@ -1433,6 +1515,18 @@ function waitingDetail(session) {
  */
 function shortSessionId(sessionId) {
   return sessionId ? sessionId.slice(0, 8) : "-";
+}
+
+/**
+ * 为当前浏览器标签页生成临时客户端 ID。
+ *
+ * @returns {string} 当前页面生命周期内稳定的客户端 ID。
+ */
+function createSessionClientId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 /**

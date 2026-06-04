@@ -52,6 +52,9 @@ COMPLETED_STATUSES = {"needs_revision", "approved"}
 CLARIFICATION_COMPLETED_STATUSES = {"answered"}
 SESSION_USER_ACTION_STATUSES = {"waiting_codex", "approved"}
 PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS = 90.0
+PANEL_CLIENT_TTL_SECONDS = 30.0
+PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS = 20.0
+PANEL_CLIENT_IDLE_SHUTDOWN_REASON = "panel-client-idle"
 DEFAULT_HISTORY_KEEP_RECORDS = 50
 DEFAULT_PRUNE_DAYS = 30
 LOCAL_CORS_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -1224,6 +1227,27 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
                 self._handle_session_post(path)
                 return
 
+            if path.endswith("/client-heartbeat") and path.startswith("/api/reviews/"):
+                review_id = path.split("/")[3]
+                payload = self._read_json_body()
+                self.store.get_review(review_id)
+                self.panel_manager.record_panel_client(f"review:{review_id}", str(payload.get("clientId") or ""))
+                self._send_json({"ok": True})
+                return
+
+            if path.endswith("/client-release") and path.startswith("/api/reviews/"):
+                review_id = path.split("/")[3]
+                payload = self._read_json_body()
+                self.store.get_review(review_id)
+                self.panel_manager.release_panel_client(f"review:{review_id}", str(payload.get("clientId") or ""))
+                self._send_json(
+                    {
+                        "ok": True,
+                        "panelShutdownSeconds": PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
+                    }
+                )
+                return
+
             if path.endswith("/feedback") and path.startswith("/api/reviews/"):
                 review_id = path.split("/")[3]
                 payload = self._read_json_body()
@@ -1251,6 +1275,33 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
                 review_id = path.split("/")[3]
                 review = self.store.reopen_review(review_id)
                 self._send_json({"review": review})
+                return
+
+            if path.endswith("/client-heartbeat") and path.startswith("/api/clarifications/"):
+                clarification_id = path.split("/")[3]
+                payload = self._read_json_body()
+                self.store.get_clarification(clarification_id)
+                self.panel_manager.record_panel_client(
+                    f"clarify:{clarification_id}",
+                    str(payload.get("clientId") or ""),
+                )
+                self._send_json({"ok": True})
+                return
+
+            if path.endswith("/client-release") and path.startswith("/api/clarifications/"):
+                clarification_id = path.split("/")[3]
+                payload = self._read_json_body()
+                self.store.get_clarification(clarification_id)
+                self.panel_manager.release_panel_client(
+                    f"clarify:{clarification_id}",
+                    str(payload.get("clientId") or ""),
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "panelShutdownSeconds": PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
+                    }
+                )
                 return
 
             if path.endswith("/answer") and path.startswith("/api/clarifications/"):
@@ -1324,6 +1375,23 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
         action = parts[3]
         payload = self._read_json_body()
         item_id = str(payload.get("itemId") or "")
+
+        if action == "client-heartbeat":
+            self.store.get_session(session_id)
+            self.panel_manager.record_panel_client(f"session:{session_id}", str(payload.get("clientId") or ""))
+            self._send_json({"ok": True})
+            return
+
+        if action == "client-release":
+            self.store.get_session(session_id)
+            self.panel_manager.release_panel_client(f"session:{session_id}", str(payload.get("clientId") or ""))
+            self._send_json(
+                {
+                    "ok": True,
+                    "panelShutdownSeconds": PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
+                }
+            )
+            return
 
         if action == "clarification-answer":
             session = self.store.answer_session_clarification(session_id, item_id, payload.get("answer") or {})
@@ -1424,6 +1492,8 @@ class PanelServerManager:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._shutdown_timer: threading.Timer | None = None
+        self._shutdown_reason: str | None = None
+        self._panel_clients: dict[str, dict[str, float]] = {}
         self._port: int | None = None
 
     def ensure_started(self) -> int:
@@ -1460,9 +1530,52 @@ class PanelServerManager:
         下一轮草案，旧的延迟关闭任务不会误关正在使用的新面板。
         """
         with self._lock:
-            if self._shutdown_timer is not None:
-                self._shutdown_timer.cancel()
-                self._shutdown_timer = None
+            self._cancel_shutdown_locked()
+
+    def record_panel_client(self, panel_key: str, client_id: str) -> None:
+        """记录当前进程中某个面板标签页仍然活跃。
+
+        Args:
+            panel_key: 面板作用域，格式为 ``session:<id>``、``review:<id>`` 或 ``clarify:<id>``。
+            client_id: 前端为当前标签页生成的临时客户端 ID。
+
+        并发说明：该状态只保存在当前 MCP/HTTP 进程内，因此最多影响本线程启动的面板
+        服务。这里不扫描端口、不查找其他 Python 进程，避免误停其他 Codex 线程。
+        """
+        normalized_client_id = client_id.strip()[:80] or "anonymous"
+        with self._lock:
+            self._prune_panel_clients_locked()
+            self._panel_clients.setdefault(panel_key, {})[normalized_client_id] = time.monotonic()
+            if self._shutdown_reason == PANEL_CLIENT_IDLE_SHUTDOWN_REASON:
+                self._cancel_shutdown_locked()
+
+    def release_panel_client(self, panel_key: str, client_id: str) -> None:
+        """释放当前标签页租约，并在本进程没有活跃标签页时安排关闭 HTTP 面板。
+
+        Args:
+            panel_key: 面板作用域，格式为 ``session:<id>``、``review:<id>`` 或 ``clarify:<id>``。
+            client_id: 前端为当前标签页生成的临时客户端 ID。
+
+        设计意图：关闭网页时只关闭“服务该网页的当前进程”的 HTTP server，不使用
+        `pkill` 或端口扫描，因此不会误停其他 Codex 线程的 Plan Reviewer 服务。
+        """
+        normalized_client_id = client_id.strip()[:80] or "anonymous"
+        with self._lock:
+            clients = self._panel_clients.get(panel_key)
+            if clients is not None:
+                clients.pop(normalized_client_id, None)
+                if not clients:
+                    self._panel_clients.pop(panel_key, None)
+
+            self._prune_panel_clients_locked()
+            if self._has_active_panel_clients_locked():
+                return
+            if self._shutdown_timer is not None and self._shutdown_reason != PANEL_CLIENT_IDLE_SHUTDOWN_REASON:
+                return
+            self._schedule_shutdown_locked(
+                PANEL_CLIENT_IDLE_SHUTDOWN_REASON,
+                PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
+            )
 
     def schedule_shutdown(self, reason: str, delay_seconds: float = PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS) -> None:
         """安排本地 HTTP 面板在空闲后关闭。
@@ -1472,11 +1585,44 @@ class PanelServerManager:
             delay_seconds: 延迟秒数；留出时间让前端收到响应、Codex 读取状态。
         """
         with self._lock:
-            if self._shutdown_timer is not None:
-                self._shutdown_timer.cancel()
-            self._shutdown_timer = threading.Timer(delay_seconds, self._shutdown_server, args=(reason,))
-            self._shutdown_timer.daemon = True
-            self._shutdown_timer.start()
+            self._schedule_shutdown_locked(reason, delay_seconds)
+
+    def _schedule_shutdown_locked(self, reason: str, delay_seconds: float) -> None:
+        """在持有锁时安排关闭任务，覆盖同类旧任务。"""
+        if self._shutdown_timer is not None:
+            self._shutdown_timer.cancel()
+        self._shutdown_reason = reason
+        self._shutdown_timer = threading.Timer(delay_seconds, self._shutdown_server, args=(reason,))
+        self._shutdown_timer.daemon = True
+        self._shutdown_timer.start()
+
+    def _cancel_shutdown_locked(self) -> None:
+        """在持有锁时取消待执行关闭任务。"""
+        if self._shutdown_timer is not None:
+            self._shutdown_timer.cancel()
+            self._shutdown_timer = None
+            self._shutdown_reason = None
+
+    def _prune_panel_clients_locked(self) -> None:
+        """清理超过租约时间未发送 heartbeat 的标签页记录。"""
+        now = time.monotonic()
+        stale_panels: list[str] = []
+        for panel_key, clients in self._panel_clients.items():
+            stale_clients = [
+                client_id
+                for client_id, last_seen in clients.items()
+                if now - last_seen > PANEL_CLIENT_TTL_SECONDS
+            ]
+            for client_id in stale_clients:
+                clients.pop(client_id, None)
+            if not clients:
+                stale_panels.append(panel_key)
+        for panel_key in stale_panels:
+            self._panel_clients.pop(panel_key, None)
+
+    def _has_active_panel_clients_locked(self) -> bool:
+        """判断当前 HTTP 进程是否还有活跃 Plan Reviewer 面板标签页。"""
+        return any(bool(clients) for clients in self._panel_clients.values())
 
     def _shutdown_server(self, reason: str) -> None:
         """关闭本地 HTTP 面板服务，但不退出 MCP 进程。"""
@@ -1484,6 +1630,8 @@ class PanelServerManager:
             server = self._server
             port = self._port
             self._shutdown_timer = None
+            self._shutdown_reason = None
+            self._panel_clients.clear()
 
         if server is None:
             return

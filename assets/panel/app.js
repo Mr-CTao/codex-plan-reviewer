@@ -19,10 +19,14 @@ const state = {
   selectedBlockId: "",
   selectedText: "",
   annotations: [],
+  clientId: "",
+  heartbeatTimerId: null,
+  releasedClient: false,
   lastFocusedElement: null,
   alertTimerId: null,
 };
 
+const CLIENT_HEARTBEAT_INTERVAL_MS = 10000;
 const ANNOTATION_HIGHLIGHT_MAX_LENGTH = 280;
 const ALERT_AUTO_CLOSE_MS = 3000;
 
@@ -55,8 +59,10 @@ const dom = {
  */
 async function init() {
   state.reviewId = extractReviewId(window.location.pathname);
+  state.clientId = createReviewClientId();
   bindEvents();
   await loadReview();
+  startReviewHeartbeat();
 }
 
 /**
@@ -87,9 +93,85 @@ function bindEvents() {
   dom.alertCloseButton.addEventListener("click", () => hideAlert());
   dom.alertOverlay.addEventListener("click", handleAlertOverlayClick);
   document.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("pagehide", handlePageClose);
+  window.addEventListener("beforeunload", handlePageClose);
 
   dom.planDocument.addEventListener("mouseup", handleSelection);
   dom.planDocument.addEventListener("click", handleBlockClick);
+}
+
+/**
+ * 启动当前审阅页标签的 heartbeat。
+ *
+ * @returns {void}
+ */
+function startReviewHeartbeat() {
+  stopReviewHeartbeat();
+  state.releasedClient = false;
+  sendReviewHeartbeat().catch(() => {});
+  state.heartbeatTimerId = window.setInterval(() => {
+    sendReviewHeartbeat().catch(() => {});
+  }, CLIENT_HEARTBEAT_INTERVAL_MS);
+}
+
+/**
+ * 停止当前审阅页标签的 heartbeat 定时器。
+ *
+ * @returns {void}
+ */
+function stopReviewHeartbeat() {
+  if (state.heartbeatTimerId) {
+    window.clearInterval(state.heartbeatTimerId);
+    state.heartbeatTimerId = null;
+  }
+}
+
+/**
+ * 页面关闭或跳转时释放当前标签页租约。
+ *
+ * @returns {void}
+ */
+function handlePageClose() {
+  stopReviewHeartbeat();
+  releaseReviewClient();
+}
+
+/**
+ * 通知当前 HTTP 面板进程本审阅页仍处于打开状态。
+ *
+ * @returns {Promise<void>} heartbeat 请求完成后返回。
+ */
+async function sendReviewHeartbeat() {
+  await fetch(`/api/reviews/${encodeURIComponent(state.reviewId)}/client-heartbeat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clientId: state.clientId }),
+    keepalive: true,
+  });
+}
+
+/**
+ * 通知当前 HTTP 面板进程本审阅页已经关闭。
+ *
+ * @returns {void}
+ */
+function releaseReviewClient() {
+  if (state.releasedClient || !state.reviewId || !state.clientId) {
+    return;
+  }
+  state.releasedClient = true;
+  const payload = JSON.stringify({ clientId: state.clientId });
+  const url = `/api/reviews/${encodeURIComponent(state.reviewId)}/client-release`;
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(url, new Blob([payload], { type: "application/json" }));
+    return;
+  }
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload,
+    keepalive: true,
+  }).catch(() => {});
 }
 
 /**
@@ -667,6 +749,18 @@ function shorten(value, maxLength) {
     return value ?? "";
   }
   return `${value.slice(0, maxLength)}...`;
+}
+
+/**
+ * 为当前浏览器审阅标签页生成临时客户端 ID。
+ *
+ * @returns {string} 当前页面生命周期内稳定的客户端 ID。
+ */
+function createReviewClientId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 /**
