@@ -10,6 +10,7 @@
 
 ### Changed
 
+- 强化 Session 工作流规则：每个新 Session 至少先发布一轮澄清问题，发布澄清或草案后必须立即等待用户动作。
 - 静态面板资源加载增加本地源码目录和最新插件缓存目录兜底，避免旧面板进程在缓存升级后报 `Missing static asset`。
 - Windows 下状态文件锁从进程内 fallback 升级为基于 `msvcrt.locking` 的跨进程文件锁。
 

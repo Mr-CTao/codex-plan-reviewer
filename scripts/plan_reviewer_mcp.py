@@ -1652,7 +1652,7 @@ class PlanReviewerMcpServer:
         return [
             {
                 "name": "create_plan_workflow_session",
-                "description": "Create one persistent local workbench for requirement clarification and plan review loops.",
+                "description": "Create one persistent local workbench for the mandatory Plan Reviewer workflow. After this call, publish at least one clarification with publish_requirement_clarification_to_session, then immediately call wait_for_session_user_action.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1707,7 +1707,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "publish_requirement_clarification_to_session",
-                "description": "Publish the next single requirement-clarification question into an existing persistent workbench.",
+                "description": "Publish the mandatory next single requirement-clarification question into an existing persistent workbench. This should be the first published item in every new Session, and must be followed immediately by wait_for_session_user_action.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1757,7 +1757,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "publish_plan_review_to_session",
-                "description": "Publish the next Markdown plan draft into an existing persistent workbench.",
+                "description": "Publish the next Markdown plan draft into an existing persistent workbench after clarification. Must be followed immediately by wait_for_session_user_action so the panel can enter the waiting-for-Codex loop.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1787,7 +1787,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "wait_for_session_user_action",
-                "description": "Poll a persistent workbench until the user submits an answer, submits feedback, or approves the plan.",
+                "description": "Required wait step after publishing any clarification or plan draft. Poll a persistent workbench until the user submits an answer, submits feedback, or approves the plan.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1811,7 +1811,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "create_requirement_clarification",
-                "description": "Create a local panel for one requirement clarification question before drafting a plan.",
+                "description": "LEGACY FALLBACK ONLY when persistent Session tools are unavailable. Prefer create_plan_workflow_session plus publish_requirement_clarification_to_session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1918,7 +1918,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "create_plan_review",
-                "description": "Create a local review panel for a Codex plan draft.",
+                "description": "LEGACY FALLBACK ONLY when persistent Session tools are unavailable. Prefer publish_plan_review_to_session plus wait_for_session_user_action.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
