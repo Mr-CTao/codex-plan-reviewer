@@ -11,6 +11,15 @@ mkdir -p ~/plugins
 git clone https://github.com/Mr-CTao/codex-plan-reviewer.git ~/plugins/plan-reviewer
 ```
 
+Windows PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\plugins" | Out-Null
+git clone https://github.com/Mr-CTao/codex-plan-reviewer.git "$env:USERPROFILE\plugins\plan-reviewer"
+Set-Location "$env:USERPROFILE\plugins\plan-reviewer"
+Copy-Item .mcp.windows.json .mcp.json -Force
+```
+
 2. 安装到 Codex：
 
 ```bash
@@ -29,6 +38,12 @@ node --check assets/panel/clarify.js
 node --check assets/panel/session.js
 python3 -m py_compile scripts/plan_reviewer_mcp.py
 python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py ~/plugins/plan-reviewer
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 -m py_compile .\scripts\plan_reviewer_mcp.py
 ```
 
 如果修改了页面交互，也请运行：

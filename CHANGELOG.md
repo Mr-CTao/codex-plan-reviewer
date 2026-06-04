@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- 新增 `.mcp.windows.json`，提供 Windows Codex App 的 MCP 启动配置示例。
+- README 和贡献说明补充 Windows 安装、PowerShell 验证和状态文件路径说明。
+- Skill 兜底流程补充 Windows PowerShell 命令。
+
+### Changed
+
+- Windows 下状态文件锁从进程内 fallback 升级为基于 `msvcrt.locking` 的跨进程文件锁。
+
 ## 0.1.0
 
 ### Added

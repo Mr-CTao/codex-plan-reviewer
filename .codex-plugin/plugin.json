@@ -1,6 +1,6 @@
 {
   "name": "plan-reviewer",
-  "version": "0.1.0+codex.20260603122603",
+  "version": "0.1.0+codex.20260604031053",
   "description": "Clarify requirements and review Codex plan drafts in local panels before final approval.",
   "author": {
     "name": "Plan Reviewer contributors"

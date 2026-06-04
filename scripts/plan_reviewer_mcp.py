@@ -35,8 +35,13 @@ from urllib.parse import unquote, urlparse
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows fallback，macOS/Linux 会走真实文件锁。
+except ImportError:  # pragma: no cover - Windows 不提供 fcntl。
     fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - macOS/Linux 不提供 msvcrt。
+    msvcrt = None  # type: ignore[assignment]
 
 
 PLUGIN_VERSION_FALLBACK = "0.1.0"
@@ -219,18 +224,48 @@ class ReviewStore:
 
         设计意图：`os.replace` 只能保证单次替换原子，不能保护“读旧状态、修改、写回”
         这个复合操作。这里用独立 lock 文件把复合写操作串行化，防止多个面板进程互相
-        覆盖用户批注。Windows 或极少数无 `fcntl` 环境会退化为进程内锁，当前 macOS
-        Codex 桌面使用路径会走真实文件锁。
+        覆盖用户批注。macOS/Linux 走 `fcntl.flock`，Windows 走 `msvcrt.locking`；
+        极少数两者都不可用的环境才退化为进程内锁。
         """
         self.state_dir.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+", encoding="utf-8") as lock_file:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._acquire_cross_process_lock(lock_file)
             try:
                 yield lock_file
             finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                self._release_cross_process_lock(lock_file)
+
+    def _acquire_cross_process_lock(self, lock_file: Any) -> None:
+        """获取平台相关的跨进程文件锁。
+
+        Args:
+            lock_file: `reviews.lock` 文件句柄。
+
+        设计意图：Windows 不支持 `fcntl`，但 `msvcrt.locking` 可以锁定文件中的字节区间。
+        锁定前写入一个哨兵字节，是为了保证要锁定的第一个字节存在，避免空文件在不同
+        Python/Windows 组合上出现不可预期行为。
+        """
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            return
+
+        if msvcrt is not None:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write("\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _release_cross_process_lock(self, lock_file: Any) -> None:
+        """释放平台相关的跨进程文件锁。"""
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return
+
+        if msvcrt is not None:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _load_from_disk_locked(self) -> bool:
         """从磁盘加载状态。
