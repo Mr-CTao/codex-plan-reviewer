@@ -100,6 +100,65 @@ def get_default_state_dir() -> Path:
     return base_dir / "plan-reviewer"
 
 
+def iter_panel_asset_dirs(preferred_assets_dir: Path) -> list[Path]:
+    """返回静态面板资源目录候选列表。
+
+    Args:
+        preferred_assets_dir: 当前 HTTP 面板进程启动时绑定的资源目录。
+
+    Returns:
+        去重后的候选目录，顺序即查找优先级。
+
+    设计意图：Codex 插件升级时可能清理旧 cache 目录，但旧 HTTP 面板进程仍短暂存活。
+    如果只依赖进程启动时的旧资源目录，浏览器会看到 `Missing static asset`。这里增加
+    本地源码目录和最新个人插件缓存目录作为兜底，让旧进程在升级后也能继续返回页面。
+    """
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add_candidate(path: Path) -> None:
+        """按解析后的绝对路径去重后加入候选列表。"""
+        resolved = path.expanduser().resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(resolved)
+
+    add_candidate(preferred_assets_dir)
+    add_candidate(get_plugin_root() / "assets" / "panel")
+
+    env_assets_dir = os.environ.get("PLAN_REVIEWER_ASSETS_DIR")
+    if env_assets_dir:
+        add_candidate(Path(env_assets_dir))
+
+    add_candidate(Path.home() / "plugins" / "plan-reviewer" / "assets" / "panel")
+
+    cache_root = Path.home() / ".codex" / "plugins" / "cache" / "personal" / "plan-reviewer"
+    if cache_root.exists():
+        for version_dir in sorted(cache_root.iterdir(), key=lambda item: item.name, reverse=True):
+            if version_dir.is_dir():
+                add_candidate(version_dir / "assets" / "panel")
+
+    return candidates
+
+
+def resolve_panel_asset(preferred_assets_dir: Path, filename: str) -> Path | None:
+    """解析静态面板文件路径。
+
+    Args:
+        preferred_assets_dir: 当前 HTTP 面板进程启动时绑定的资源目录。
+        filename: 白名单静态资源文件名。
+
+    Returns:
+        找到时返回文件路径；所有候选目录均不存在该文件时返回 None。
+    """
+    for assets_dir in iter_panel_asset_dirs(preferred_assets_dir):
+        file_path = assets_dir / filename
+        if file_path.exists():
+            return file_path
+    return None
+
+
 def safe_json_dumps(payload: Any) -> str:
     """以 UTF-8 可读形式序列化 JSON，便于 Codex 在工具结果中直接解析。"""
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1295,10 +1354,16 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
         raise ValueError(f"不支持的 Session 操作: {action}")
 
     def _serve_static(self, filename: str, content_type: str) -> None:
-        """按白名单文件名返回静态资源。"""
-        file_path = self.assets_dir / filename
-        if not file_path.exists():
-            self._send_json({"error": f"Missing static asset: {filename}"}, HTTPStatus.NOT_FOUND)
+        """按白名单文件名返回静态资源，并兼容插件升级后的旧面板进程。"""
+        file_path = resolve_panel_asset(self.assets_dir, filename)
+        if file_path is None:
+            self._send_json(
+                {
+                    "error": f"Missing static asset: {filename}",
+                    "assetDirs": [str(path) for path in iter_panel_asset_dirs(self.assets_dir)],
+                },
+                HTTPStatus.NOT_FOUND,
+            )
             return
 
         data = file_path.read_bytes()
