@@ -942,11 +942,18 @@ async function submitPlanFeedback(item) {
 async function approvePlan(item) {
   setBusy(true);
   try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ itemId: item.id }),
-    });
+    let response;
+    try {
+      response = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ itemId: item.id }),
+      });
+    } catch {
+      throw new Error(
+        "无法连接本地 Plan Reviewer 面板服务。请刷新页面；如果仍失败，请在 Codex 新线程重新打开最新面板。"
+      );
+    }
     const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload.error ?? "通过计划失败。");

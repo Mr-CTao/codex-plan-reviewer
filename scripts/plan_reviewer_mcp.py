@@ -20,9 +20,12 @@ import argparse
 from contextlib import contextmanager
 import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from dataclasses import dataclass
@@ -63,6 +66,8 @@ LOCAL_CORS_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_FREEFORM_OPTION_LABEL = "D"
 DEFAULT_FREEFORM_OPTION_TITLE = "其他"
 SESSION_POLL_SECONDS = 1.0
+SURROGATE_RE = re.compile("[\ud800-\udfff]")
+REPLACEMENT_CHARACTER = "\ufffd"
 
 
 def utc_now_iso() -> str:
@@ -164,9 +169,42 @@ def resolve_panel_asset(preferred_assets_dir: Path, filename: str) -> Path | Non
     return None
 
 
-def safe_json_dumps(payload: Any) -> str:
-    """以 UTF-8 可读形式序列化 JSON，便于 Codex 在工具结果中直接解析。"""
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+def sanitize_for_json(value: Any) -> Any:
+    """递归清洗 JSON 边界数据中的非法孤立 surrogate 字符。
+
+    Args:
+        value: 即将进入状态文件、HTTP 响应、MCP structuredContent/content 或 JSON-RPC
+            stdout 的任意 JSON-like 数据。
+
+    Returns:
+        已清洗的数据副本；正常中文、英文、标点和 emoji 保持原样，仅把 U+D800 到
+        U+DFFF 范围内的 surrogate 码点替换为 U+FFFD。
+
+    设计意图：UTF-8 能编码中文和 emoji，但不能编码孤立 surrogate。这里在 JSON 边界统一
+    清洗，避免脏输入先进入状态文件，再在 stdout、HTTP 或下一次保存时触发编码崩溃。
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return SURROGATE_RE.sub(REPLACEMENT_CHARACTER, value)
+    if isinstance(value, dict):
+        return {sanitize_for_json(key): sanitize_for_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_for_json(item) for item in value]
+    return value
+
+
+def safe_json_dumps(payload: Any, *, indent: int | None = 2) -> str:
+    """以 UTF-8 可读形式安全序列化 JSON，便于 Codex 和本地面板直接解析。
+
+    Args:
+        payload: 待序列化的数据。
+        indent: 缩进空格数；JSON-RPC stdout 需要单行时传入 None。
+
+    Returns:
+        不含非法 surrogate 的 JSON 字符串。
+    """
+    return json.dumps(sanitize_for_json(payload), ensure_ascii=False, indent=indent)
 
 
 def open_url_in_background(url: str) -> None:
@@ -271,12 +309,17 @@ class ReviewStore:
         self.lock_path = state_dir / "reviews.lock"
         self._lock = threading.RLock()
         self._state: dict[str, Any] = {"reviews": {}, "clarifications": {}, "sessions": {}}
+        self._state_requires_repair = False
         self._initialize_state()
 
     def _initialize_state(self) -> None:
         """首次加载状态文件；缺失时在跨进程锁内创建空文件。"""
         with self._lock, self._state_file_lock():
-            if not self._load_from_disk_locked():
+            loaded = self._load_from_disk_locked()
+            if not loaded:
+                self._save_locked()
+            elif self._state_requires_repair:
+                self._backup_state_file_locked("surrogate-sanitized")
                 self._save_locked()
 
     @contextmanager
@@ -331,6 +374,31 @@ class ReviewStore:
             lock_file.seek(0)
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
+    def _backup_state_file_locked(self, reason: str) -> Path:
+        """在修复既有状态文件前创建同目录备份。
+
+        Args:
+            reason: 备份原因，会出现在备份文件名中，方便后续排查。
+
+        Returns:
+            已创建的备份文件路径。
+
+        并发说明：调用方已经持有跨进程文件锁，因此这里不会和其他 MCP/HTTP 进程的保存
+        操作并发覆盖。只有检测到历史状态里存在非法 surrogate 时才备份，避免正常启动时
+        制造不必要的文件。
+        """
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        backup_path = self.state_path.with_name(f"{self.state_path.name}.{reason}.{timestamp}.bak")
+        suffix = 1
+        while backup_path.exists():
+            backup_path = self.state_path.with_name(
+                f"{self.state_path.name}.{reason}.{timestamp}.{suffix}.bak"
+            )
+            suffix += 1
+        shutil.copy2(self.state_path, backup_path)
+        print(f"[plan-reviewer] backed up sanitized state to {backup_path}", file=sys.stderr)
+        return backup_path
+
     def _load_from_disk_locked(self) -> bool:
         """从磁盘加载状态。
 
@@ -340,12 +408,18 @@ class ReviewStore:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         if not self.state_path.exists():
             self._state = {"reviews": {}, "clarifications": {}, "sessions": {}}
+            self._state_requires_repair = False
             return False
 
         try:
-            self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            loaded_state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Plan Reviewer 状态文件损坏: {self.state_path}") from exc
+        sanitized_state = sanitize_for_json(loaded_state)
+        if not isinstance(sanitized_state, dict):
+            raise RuntimeError("Plan Reviewer 状态文件根节点必须是 JSON 对象。")
+        self._state_requires_repair = sanitized_state != loaded_state
+        self._state = sanitized_state
 
         if not isinstance(self._state.get("reviews"), dict):
             raise RuntimeError("Plan Reviewer 状态文件缺少 reviews 对象。")
@@ -369,9 +443,11 @@ class ReviewStore:
     def _save_locked(self) -> None:
         """在持有锁时保存状态，避免并发 HTTP 请求互相覆盖。"""
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._state = sanitize_for_json(self._state)
         tmp_path = self.state_path.with_suffix(".json.tmp")
         tmp_path.write_text(safe_json_dumps(self._state), encoding="utf-8")
         os.replace(tmp_path, self.state_path)
+        self._state_requires_repair = False
 
     def create_review(self, title: str, plan_markdown: str, iteration: int | None) -> dict[str, Any]:
         """创建新的计划草案审阅记录。
@@ -409,7 +485,7 @@ class ReviewStore:
             self._refresh_locked()
             self._state["reviews"][review_id] = review
             self._save_locked()
-            return dict(review)
+            return sanitize_for_json(review)
 
     def get_review(self, review_id: str) -> dict[str, Any]:
         """按 ID 读取审阅记录。
@@ -428,7 +504,7 @@ class ReviewStore:
             review = self._state["reviews"].get(review_id)
             if review is None:
                 raise KeyError(f"未找到审阅记录: {review_id}")
-            return json.loads(json.dumps(review, ensure_ascii=False))
+            return sanitize_for_json(review)
 
     def list_reviews(self, limit: int) -> list[dict[str, Any]]:
         """列出最近的审阅记录。
@@ -510,7 +586,7 @@ class ReviewStore:
             self._refresh_locked()
             self._state["clarifications"][clarification_id] = clarification
             self._save_locked()
-            return dict(clarification)
+            return sanitize_for_json(clarification)
 
     def get_clarification(self, clarification_id: str) -> dict[str, Any]:
         """按 ID 读取需求澄清记录。
@@ -529,7 +605,7 @@ class ReviewStore:
             clarification = self._state["clarifications"].get(clarification_id)
             if clarification is None:
                 raise KeyError(f"未找到需求澄清记录: {clarification_id}")
-            return json.loads(json.dumps(clarification, ensure_ascii=False))
+            return sanitize_for_json(clarification)
 
     def answer_clarification(self, clarification_id: str, answer: dict[str, Any]) -> dict[str, Any]:
         """保存用户对单轮需求澄清问题的回答。
@@ -559,7 +635,7 @@ class ReviewStore:
             clarification["status"] = "answered"
             clarification["updatedAt"] = utc_now_iso()
             self._save_locked()
-            return dict(clarification)
+            return sanitize_for_json(clarification)
 
     def create_session(self, title: str, original_request: str) -> dict[str, Any]:
         """创建持续工作流会话。
@@ -592,7 +668,7 @@ class ReviewStore:
             self._refresh_locked()
             self._state["sessions"][session_id] = session
             self._save_locked()
-            return json.loads(json.dumps(session, ensure_ascii=False))
+            return sanitize_for_json(session)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         """按 ID 读取持续工作流会话。
@@ -611,7 +687,7 @@ class ReviewStore:
             session = self._state["sessions"].get(session_id)
             if session is None:
                 raise KeyError(f"未找到工作流会话: {session_id}")
-            return json.loads(json.dumps(session, ensure_ascii=False))
+            return sanitize_for_json(session)
 
     def publish_session_clarification(
         self,
@@ -838,7 +914,7 @@ class ReviewStore:
             session["codexSeq"] = int(session.get("codexSeq") or 0) + 1
             session["updatedAt"] = now
             self._save_locked()
-            return json.loads(json.dumps(session, ensure_ascii=False))
+            return sanitize_for_json(session)
 
     def _ensure_session_can_publish_plan_review_locked(self, session: dict[str, Any]) -> None:
         """确认首个计划草案发布前已经完成至少一轮 Session 需求澄清。
@@ -915,7 +991,7 @@ class ReviewStore:
             mutate(session, item, now)
             session["updatedAt"] = now
             self._save_locked()
-            return json.loads(json.dumps(session, ensure_ascii=False))
+            return sanitize_for_json(session)
 
     def _find_session_item(self, session: dict[str, Any], item_id: str) -> dict[str, Any] | None:
         """在 session.items 中查找指定步骤，找不到时返回 None。"""
@@ -989,7 +1065,7 @@ class ReviewStore:
             review["status"] = "needs_revision"
             review["updatedAt"] = utc_now_iso()
             self._save_locked()
-            return dict(review)
+            return sanitize_for_json(review)
 
     def approve_review(self, review_id: str) -> dict[str, Any]:
         """将审阅标记为通过，表示 Codex 可以输出正式 Plan。
@@ -1011,7 +1087,7 @@ class ReviewStore:
             review["status"] = "approved"
             review["updatedAt"] = utc_now_iso()
             self._save_locked()
-            return dict(review)
+            return sanitize_for_json(review)
 
     def reopen_review(self, review_id: str) -> dict[str, Any]:
         """重新打开审阅，供用户撤销误点通过时使用。"""
@@ -1023,7 +1099,7 @@ class ReviewStore:
             review["status"] = "pending"
             review["updatedAt"] = utc_now_iso()
             self._save_locked()
-            return dict(review)
+            return sanitize_for_json(review)
 
     def prune_reviews(
         self,
@@ -1384,11 +1460,11 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
             if path.endswith("/approve") and path.startswith("/api/reviews/"):
                 review_id = path.split("/")[3]
                 review = self.store.approve_review(review_id)
-                self._send_json({"review": review, "panelShutdownSeconds": PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS})
                 self.panel_manager.schedule_shutdown(
                     "review-approved",
                     PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS,
                 )
+                self._send_json({"review": review, "panelShutdownSeconds": PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS})
                 return
 
             if path.endswith("/reopen") and path.startswith("/api/reviews/"):
@@ -1435,6 +1511,15 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
         except (KeyError, ValueError) as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:  # noqa: BLE001
+            # 未预期异常也必须返回 JSON，避免浏览器只能看到 TypeError: Failed to fetch。
+            traceback.print_exc(file=sys.stderr)
+            self._send_json(
+                {
+                    "error": "Plan Reviewer 服务端处理请求失败，请刷新面板；如果仍失败，请在 Codex 新线程重新打开最新面板。",
+                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_OPTIONS(self) -> None:
         """处理本地跨源预检请求。
@@ -1453,6 +1538,11 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
         review_id = path.split("/")[3]
         try:
             review = self.store.get_review(review_id)
+            if review.get("status") == "approved":
+                self.panel_manager.schedule_shutdown(
+                    "review-approved-refresh",
+                    PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS,
+                )
             self._send_json({"review": review})
         except KeyError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
@@ -1476,6 +1566,11 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
         session_id = parts[2]
         try:
             session = self.store.get_session(session_id)
+            if session.get("status") == "approved":
+                self.panel_manager.schedule_shutdown(
+                    "session-approved-refresh",
+                    PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS,
+                )
             self._send_json({"session": session})
         except KeyError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
@@ -1532,11 +1627,11 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
 
         if action == "approve":
             session = self.store.approve_session_plan(session_id, item_id)
-            self._send_json({"session": session, "panelShutdownSeconds": PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS})
             self.panel_manager.schedule_shutdown(
                 "session-plan-approved",
                 PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS,
             )
+            self._send_json({"session": session, "panelShutdownSeconds": PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS})
             return
 
         raise ValueError(f"不支持的 Session 操作: {action}")
@@ -1569,7 +1664,7 @@ class ReviewHttpHandler(BaseHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
         if not raw_body:
             return {}
-        return json.loads(raw_body.decode("utf-8"))
+        return sanitize_for_json(json.loads(raw_body.decode("utf-8")))
 
     def _send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         """发送 JSON 响应，并允许本地面板 fetch 调用。"""
@@ -1897,12 +1992,14 @@ class PlanReviewerMcpServer:
 
     def run(self) -> None:
         """持续读取 stdin JSON-RPC 消息并写回 stdout 响应。"""
-        for line in sys.stdin:
-            if not line.strip():
-                continue
-
+        input_stream = getattr(sys.stdin, "buffer", None) or sys.stdin
+        for raw_line in input_stream:
+            line = ""
             try:
-                message = json.loads(line)
+                line = self._decode_stdin_line(raw_line)
+                if not line.strip():
+                    continue
+                message = sanitize_for_json(json.loads(line))
                 response = self._handle_message(message)
                 if response is not None:
                     self._write_response(response)
@@ -1916,6 +2013,23 @@ class PlanReviewerMcpServer:
                         "error": {"code": -32000, "message": str(exc)},
                     }
                 )
+
+    def _decode_stdin_line(self, raw_line: bytes | str) -> str:
+        """把 MCP STDIO 输入行按 UTF-8 解码为文本。
+
+        Args:
+            raw_line: 从 stdin buffer 读取到的原始 bytes，或测试替身提供的 str。
+
+        Returns:
+            UTF-8 解码后的 JSON-RPC 单行文本。
+
+        设计意图：MCP STDIO 按 UTF-8 传输。Windows 上 `sys.stdin` 文本流可能默认使用 GBK，
+        如果直接迭代文本流，中文会在进入 `json.loads` 前变成 mojibake。这里优先读取
+        `sys.stdin.buffer`，把编码边界固定在 UTF-8。
+        """
+        if isinstance(raw_line, bytes):
+            return raw_line.decode("utf-8")
+        return raw_line
 
     def _handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         """分发 MCP 请求和通知。
@@ -2638,9 +2752,10 @@ class PlanReviewerMcpServer:
 
     def _tool_result(self, payload: dict[str, Any]) -> dict[str, Any]:
         """包装 MCP tool result，同时提供文本 JSON 和结构化内容。"""
+        clean_payload = sanitize_for_json(payload)
         return {
-            "content": [{"type": "text", "text": safe_json_dumps(payload)}],
-            "structuredContent": payload,
+            "content": [{"type": "text", "text": safe_json_dumps(clean_payload)}],
+            "structuredContent": clean_payload,
         }
 
     def _response(self, message_id: Any, result: Any) -> dict[str, Any]:
@@ -2649,13 +2764,21 @@ class PlanReviewerMcpServer:
 
     def _write_response(self, response: dict[str, Any]) -> None:
         """写出一行 JSON-RPC 响应并立即 flush。"""
-        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        data = (safe_json_dumps(response, indent=None) + "\n").encode("utf-8")
+        stdout_buffer = getattr(sys.stdout, "buffer", None)
+        if stdout_buffer is not None:
+            # MCP STDIO 按 UTF-8 字节传输；绕开 Windows 文本 stdout 的本地代码页，避免中文、
+            # emoji 或 U+FFFD 在 GBK 等非 UTF-8 环境中再次触发编码异常。
+            stdout_buffer.write(data)
+            stdout_buffer.flush()
+            return
+        sys.stdout.write(data.decode("utf-8"))
         sys.stdout.flush()
 
     def _safe_message_id(self, raw_line: str) -> Any:
         """异常路径下尽量从原始消息提取 id，便于客户端匹配错误响应。"""
         try:
-            return json.loads(raw_line).get("id")
+            return sanitize_for_json(json.loads(raw_line)).get("id")
         except Exception:  # noqa: BLE001
             return None
 
