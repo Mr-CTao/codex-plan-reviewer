@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "plan_reviewer": {
-      "command": "python",
+      "command": "python3",
       "args": [
         "scripts/plan_reviewer_mcp.py"
       ],

@@ -67,8 +67,10 @@ async function init() {
   state.clientId = createSessionClientId();
   bindEvents();
   await loadSession({ force: true });
-  startPolling();
-  startSessionHeartbeat();
+  if (shouldKeepSessionLive(state.session)) {
+    startPolling();
+    startSessionHeartbeat();
+  }
 }
 
 /**
@@ -233,6 +235,11 @@ function applySession(session, options = {}) {
   const shouldRender = options.force || nextSignature !== state.renderSignature;
   state.session = session;
   state.renderSignature = nextSignature;
+  if (!shouldKeepSessionLive(session)) {
+    // Approved 是终态；继续轮询会反复触发后端 approved GET，并把延迟关闭计时器不断后移。
+    stopPolling();
+    stopSessionHeartbeat();
+  }
   if (shouldRender && options.silent) {
     state.message = statusMessage(session);
   }
@@ -260,6 +267,16 @@ function buildRenderSignature(session) {
     session?.actionSeq ?? 0,
     session?.codexSeq ?? 0,
   ].join("|");
+}
+
+/**
+ * 判断当前 session 是否还需要维持前端轮询和 heartbeat。
+ *
+ * @param {Record<string, unknown> | null} session 当前后端 session；为空时按非终态处理。
+ * @returns {boolean} 需要继续轮询和发送 heartbeat 时返回 true。
+ */
+function shouldKeepSessionLive(session) {
+  return session?.status !== "approved";
 }
 
 /**
