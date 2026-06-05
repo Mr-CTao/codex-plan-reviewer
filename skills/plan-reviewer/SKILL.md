@@ -181,5 +181,7 @@ Codex 本地状态目录下的 `plan-reviewer/reviews.json`。不要把包含密
 
 状态文件使用 `reviews.lock` 做跨进程写保护，macOS/Linux 通过 `fcntl.flock` 实现，Windows
 通过 `msvcrt.locking` 实现，避免 MCP、CLI 兜底和旧面板进程同时写入时互相覆盖。
-当用户要求清理历史记录时，优先使用 `prune_plan_reviews` 保留近期记录；只有用户明确要求清空时，
-才调用 `clear_plan_reviews({ confirm: true })`。
+当用户要求清理历史记录时，优先使用 `prune_plan_reviews` 保留每类近期记录；该工具会处理审阅、
+澄清和 Session，默认只删除已完成记录，不会误删 pending/未完成 Session。只有用户明确要求清空时，
+才调用 `clear_plan_reviews({ confirm: true })`；若用户要求连同未完成记录一起清理，再加
+`include_pending: true`。

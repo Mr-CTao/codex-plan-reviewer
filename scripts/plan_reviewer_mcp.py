@@ -50,9 +50,11 @@ MAX_PORT_ATTEMPTS = 50
 MAX_REQUEST_BYTES = 1_048_576
 COMPLETED_STATUSES = {"needs_revision", "approved"}
 CLARIFICATION_COMPLETED_STATUSES = {"answered"}
-SESSION_USER_ACTION_STATUSES = {"waiting_codex", "approved"}
+SESSION_COMPLETED_STATUSES = {"approved"}
+HISTORY_COLLECTIONS = ("reviews", "clarifications", "sessions")
 PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS = 90.0
 PANEL_CLIENT_TTL_SECONDS = 30.0
+PANEL_CLIENT_WATCHDOG_INTERVAL_SECONDS = 10.0
 PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS = 20.0
 PANEL_CLIENT_IDLE_SHUTDOWN_REASON = "panel-client-idle"
 DEFAULT_HISTORY_KEEP_RECORDS = 50
@@ -677,7 +679,7 @@ class ReviewStore:
             更新后的 session。
 
         Raises:
-            ValueError: plan_markdown 为空时抛出。
+            ValueError: plan_markdown 为空，或首个计划草案发布前未完成需求澄清时抛出。
         """
         normalized_plan = plan_markdown.strip()
         if not normalized_plan:
@@ -811,6 +813,7 @@ class ReviewStore:
 
         Raises:
             KeyError: 指定 session 不存在时抛出。
+            ValueError: 首个计划草案发布前尚未完成需求澄清时抛出。
 
         并发说明：Codex 发布下一步和用户在面板提交动作都写同一个 session，因此必须
         持有跨进程文件锁。发布新步骤时清空 `lastUserAction`，避免 Codex 误读上一轮
@@ -821,6 +824,9 @@ class ReviewStore:
             session = self._state["sessions"].get(session_id)
             if session is None:
                 raise KeyError(f"未找到工作流会话: {session_id}")
+
+            if item.get("type") == "plan_review":
+                self._ensure_session_can_publish_plan_review_locked(session)
 
             now = utc_now_iso()
             item.setdefault("createdAt", now)
@@ -833,6 +839,30 @@ class ReviewStore:
             session["updatedAt"] = now
             self._save_locked()
             return json.loads(json.dumps(session, ensure_ascii=False))
+
+    def _ensure_session_can_publish_plan_review_locked(self, session: dict[str, Any]) -> None:
+        """确认首个计划草案发布前已经完成至少一轮 Session 需求澄清。
+
+        Args:
+            session: 调用方已经在文件锁内读取到的会话对象。
+
+        Raises:
+            ValueError: 当前 session 尚未完成任何需求澄清回答时抛出。
+
+        设计意图：Skill/Prompt 会指导 Codex 先澄清，但真正的状态机约束必须放在后端
+        写入路径。这里只约束首个 plan review，是为了让旧状态文件中已经进入审阅流程
+        的会话还能继续迭代，避免一次升级切断已有工作流。
+        """
+        items = session.get("items") or []
+        has_existing_plan_review = any(item.get("type") == "plan_review" for item in items)
+        if has_existing_plan_review:
+            return
+
+        has_answered_clarification = any(
+            item.get("type") == "clarification" and item.get("status") == "answered" for item in items
+        )
+        if not has_answered_clarification:
+            raise ValueError("请先发布并完成需求澄清，然后再发布计划草案。")
 
     def _mutate_active_session_item(
         self,
@@ -1001,15 +1031,15 @@ class ReviewStore:
         older_than_days: int | None = DEFAULT_PRUNE_DAYS,
         include_pending: bool = False,
     ) -> dict[str, Any]:
-        """修剪本地历史审阅记录。
+        """修剪本地历史记录。
 
         Args:
-            keep_latest: 至少保留最近多少条记录。
+            keep_latest: 每类历史至少保留最近多少条记录。
             older_than_days: 删除早于该天数的记录；None 表示只按数量修剪。
-            include_pending: 是否允许删除仍处于 pending 的记录。
+            include_pending: 是否允许删除仍处于 pending 或未完成的记录。
 
         Returns:
-            包含删除数量、保留数量和删除 ID 的摘要。
+            包含 reviews、clarifications、sessions 删除数量、保留数量和删除 ID 的摘要。
 
         并发说明：修剪会改变共享状态文件，因此与创建、提交、通过一样持有跨进程文件锁。
         """
@@ -1019,39 +1049,27 @@ class ReviewStore:
 
         with self._lock, self._state_file_lock():
             self._refresh_locked()
-            reviews = list(self._state["reviews"].values())
-            reviews.sort(key=lambda item: item.get("updatedAt", ""), reverse=True)
-            keep_ids = {item.get("id") for item in reviews[:bounded_keep_latest]}
-            removed_ids: list[str] = []
-
-            for review in reviews:
-                review_id = str(review.get("id") or "")
-                if not review_id or review_id in keep_ids:
-                    continue
-                if not include_pending and review.get("status", "pending") == "pending":
-                    continue
-                if cutoff is not None and self._review_timestamp(review) >= cutoff:
-                    continue
-                removed_ids.append(review_id)
-
-            for review_id in removed_ids:
-                self._state["reviews"].pop(review_id, None)
-
-            if removed_ids:
-                self._save_locked()
-
-            return {
-                "removed": len(removed_ids),
-                "kept": len(self._state["reviews"]),
-                "removedIds": removed_ids,
+            removed_by_type = {
+                collection_name: self._prune_history_collection_locked(
+                    collection_name,
+                    bounded_keep_latest,
+                    cutoff,
+                    include_pending,
+                )
+                for collection_name in HISTORY_COLLECTIONS
             }
 
+            if any(removed_by_type.values()):
+                self._save_locked()
+
+            return self._build_history_cleanup_summary(removed_by_type)
+
     def clear_reviews(self, confirm: bool, include_pending: bool = False) -> dict[str, Any]:
-        """清空本地审阅记录。
+        """清空本地历史记录。
 
         Args:
-            confirm: 必须显式为 True，避免误删历史批注。
-            include_pending: 是否一并删除还未完成的 pending 记录。
+            confirm: 必须显式为 True，避免误删历史批注、澄清和 Session。
+            include_pending: 是否一并删除还未完成的 pending 记录或未完成 Session。
 
         Returns:
             删除摘要。
@@ -1064,20 +1082,122 @@ class ReviewStore:
 
         with self._lock, self._state_file_lock():
             self._refresh_locked()
-            removed_ids = [
-                str(review_id)
-                for review_id, review in self._state["reviews"].items()
-                if include_pending or review.get("status", "pending") != "pending"
-            ]
-            for review_id in removed_ids:
-                self._state["reviews"].pop(review_id, None)
-            if removed_ids:
-                self._save_locked()
-            return {
-                "removed": len(removed_ids),
-                "kept": len(self._state["reviews"]),
-                "removedIds": removed_ids,
+            removed_by_type = {
+                collection_name: self._clear_history_collection_locked(collection_name, include_pending)
+                for collection_name in HISTORY_COLLECTIONS
             }
+            if any(removed_by_type.values()):
+                self._save_locked()
+            return self._build_history_cleanup_summary(removed_by_type)
+
+    def _prune_history_collection_locked(
+        self,
+        collection_name: str,
+        keep_latest: int,
+        cutoff: float | None,
+        include_pending: bool,
+    ) -> list[str]:
+        """按时间和保留数量裁剪指定历史集合。
+
+        Args:
+            collection_name: 状态文件中的集合名，如 reviews、clarifications 或 sessions。
+            keep_latest: 该集合始终保留的最新记录数。
+            cutoff: 早于该 Unix 时间戳的记录才允许删除；None 表示只按数量裁剪。
+            include_pending: 是否允许删除未完成记录。
+
+        Returns:
+            已删除记录 ID 列表。
+
+        设计意图：Session 主流程数据和旧版 reviews 一样写在同一个状态文件里。清理时
+        统一使用 updatedAt/createdAt 排序，避免只清掉旧 reviews 却遗留大量 Session。
+        """
+        records = list(self._state.get(collection_name, {}).values())
+        records.sort(key=self._history_record_timestamp, reverse=True)
+        keep_ids = {str(record.get("id") or "") for record in records[:keep_latest]}
+        removed_ids: list[str] = []
+
+        for record in records:
+            record_id = str(record.get("id") or "")
+            if not record_id or record_id in keep_ids:
+                continue
+            if not include_pending and self._is_pending_history_record(collection_name, record):
+                continue
+            if cutoff is not None and self._history_record_timestamp(record) >= cutoff:
+                continue
+            removed_ids.append(record_id)
+
+        for record_id in removed_ids:
+            self._state.get(collection_name, {}).pop(record_id, None)
+        return removed_ids
+
+    def _clear_history_collection_locked(self, collection_name: str, include_pending: bool) -> list[str]:
+        """清空指定历史集合中允许删除的记录。
+
+        Args:
+            collection_name: 状态文件中的集合名。
+            include_pending: 是否允许删除未完成记录。
+
+        Returns:
+            已删除记录 ID 列表。
+        """
+        collection = self._state.get(collection_name, {})
+        removed_ids = [
+            str(record_id)
+            for record_id, record in collection.items()
+            if include_pending or not self._is_pending_history_record(collection_name, record)
+        ]
+        for record_id in removed_ids:
+            collection.pop(record_id, None)
+        return removed_ids
+
+    def _is_pending_history_record(self, collection_name: str, record: dict[str, Any]) -> bool:
+        """判断历史记录是否仍应被默认保护。
+
+        Args:
+            collection_name: 记录所属集合。
+            record: 单条历史记录。
+
+        Returns:
+            True 表示未完成，只有 include_pending=true 时才允许删除。
+        """
+        status = str(record.get("status") or "pending")
+        if collection_name == "clarifications":
+            return status not in CLARIFICATION_COMPLETED_STATUSES
+        if collection_name == "sessions":
+            # Session 只有用户最终通过计划后才算完成；waiting_codex 也可能还在等 Codex 回写。
+            return status not in SESSION_COMPLETED_STATUSES
+        return status == "pending"
+
+    def _build_history_cleanup_summary(self, removed_by_type: dict[str, list[str]]) -> dict[str, Any]:
+        """生成清理工具的兼容摘要。
+
+        Args:
+            removed_by_type: 每个历史集合已删除的 ID 列表。
+
+        Returns:
+            兼容旧字段的总览，并额外返回按类型拆分的数量和 ID。
+        """
+        kept_by_type = {
+            collection_name: len(self._state.get(collection_name, {})) for collection_name in HISTORY_COLLECTIONS
+        }
+        removed_ids = [
+            record_id
+            for collection_name in HISTORY_COLLECTIONS
+            for record_id in removed_by_type.get(collection_name, [])
+        ]
+        return {
+            "removed": len(removed_ids),
+            "kept": sum(kept_by_type.values()),
+            "removedIds": removed_ids,
+            "removedReviewIds": removed_by_type.get("reviews", []),
+            "removedClarificationIds": removed_by_type.get("clarifications", []),
+            "removedSessionIds": removed_by_type.get("sessions", []),
+            "removedByType": {
+                collection_name: len(removed_by_type.get(collection_name, []))
+                for collection_name in HISTORY_COLLECTIONS
+            },
+            "keptByType": kept_by_type,
+        }
 
     def _clean_annotation(self, annotation: dict[str, Any]) -> dict[str, Any]:
         """清洗单条批注字段，限制长度以避免状态文件被异常输入撑大。"""
@@ -1146,9 +1266,9 @@ class ReviewStore:
             "finalAnswer": final_answer,
         }
 
-    def _review_timestamp(self, review: dict[str, Any]) -> float:
-        """把审阅更新时间转换为 Unix 时间戳，解析失败时按最老记录处理。"""
-        value = str(review.get("updatedAt") or review.get("createdAt") or "")
+    def _history_record_timestamp(self, record: dict[str, Any]) -> float:
+        """把历史记录更新时间转换为 Unix 时间戳，解析失败时按最老记录处理。"""
+        value = str(record.get("updatedAt") or record.get("createdAt") or "")
         try:
             return datetime.fromisoformat(value).timestamp()
         except ValueError:
@@ -1492,8 +1612,10 @@ class PanelServerManager:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._shutdown_timer: threading.Timer | None = None
+        self._client_watchdog_timer: threading.Timer | None = None
         self._shutdown_reason: str | None = None
         self._panel_clients: dict[str, dict[str, float]] = {}
+        self._has_seen_panel_client = False
         self._port: int | None = None
 
     def ensure_started(self) -> int:
@@ -1544,10 +1666,12 @@ class PanelServerManager:
         """
         normalized_client_id = client_id.strip()[:80] or "anonymous"
         with self._lock:
+            self._has_seen_panel_client = True
             self._prune_panel_clients_locked()
             self._panel_clients.setdefault(panel_key, {})[normalized_client_id] = time.monotonic()
             if self._shutdown_reason == PANEL_CLIENT_IDLE_SHUTDOWN_REASON:
                 self._cancel_shutdown_locked()
+            self._schedule_client_watchdog_locked()
 
     def release_panel_client(self, panel_key: str, client_id: str) -> None:
         """释放当前标签页租约，并在本进程没有活跃标签页时安排关闭 HTTP 面板。
@@ -1570,12 +1694,15 @@ class PanelServerManager:
             self._prune_panel_clients_locked()
             if self._has_active_panel_clients_locked():
                 return
+            if not self._has_seen_panel_client:
+                return
             if self._shutdown_timer is not None and self._shutdown_reason != PANEL_CLIENT_IDLE_SHUTDOWN_REASON:
                 return
             self._schedule_shutdown_locked(
                 PANEL_CLIENT_IDLE_SHUTDOWN_REASON,
                 PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
             )
+            self._schedule_client_watchdog_locked()
 
     def schedule_shutdown(self, reason: str, delay_seconds: float = PANEL_APPROVED_SHUTDOWN_DELAY_SECONDS) -> None:
         """安排本地 HTTP 面板在空闲后关闭。
@@ -1624,6 +1751,41 @@ class PanelServerManager:
         """判断当前 HTTP 进程是否还有活跃 Plan Reviewer 面板标签页。"""
         return any(bool(clients) for clients in self._panel_clients.values())
 
+    def _schedule_client_watchdog_locked(self) -> None:
+        """在 HTTP 面板运行时安排轻量 client 租约巡检。
+
+        设计意图：浏览器关闭时 `sendBeacon` 可能丢失，单靠 release API 会让当前进程误以为
+        标签页仍活跃。watchdog 只检查本进程内存中的 client 租约，不扫描端口、不查进程，
+        因此不会影响其他 Codex 线程启动的面板。只有见过真实面板标签页 heartbeat 后才
+        启动巡检，避免 `open_browser=false` 或 `--serve-only` 打印 URL 后被提前判空闲。
+        """
+        if self._server is None or not self._has_seen_panel_client or self._client_watchdog_timer is not None:
+            return
+        self._client_watchdog_timer = threading.Timer(
+            PANEL_CLIENT_WATCHDOG_INTERVAL_SECONDS,
+            self._run_client_watchdog,
+        )
+        self._client_watchdog_timer.daemon = True
+        self._client_watchdog_timer.start()
+
+    def _run_client_watchdog(self) -> None:
+        """周期性清理过期标签页租约，并在完全空闲时安排关闭当前 HTTP 面板。"""
+        with self._lock:
+            self._client_watchdog_timer = None
+            if self._server is None:
+                return
+
+            self._prune_panel_clients_locked()
+            if not self._has_seen_panel_client:
+                return
+            if not self._has_active_panel_clients_locked() and self._shutdown_timer is None:
+                self._schedule_shutdown_locked(
+                    PANEL_CLIENT_IDLE_SHUTDOWN_REASON,
+                    PANEL_CLIENT_IDLE_SHUTDOWN_DELAY_SECONDS,
+                )
+
+            self._schedule_client_watchdog_locked()
+
     def _shutdown_server(self, reason: str) -> None:
         """关闭本地 HTTP 面板服务，但不退出 MCP 进程。"""
         with self._lock:
@@ -1631,7 +1793,11 @@ class PanelServerManager:
             port = self._port
             self._shutdown_timer = None
             self._shutdown_reason = None
+            if self._client_watchdog_timer is not None:
+                self._client_watchdog_timer.cancel()
+                self._client_watchdog_timer = None
             self._panel_clients.clear()
+            self._has_seen_panel_client = False
 
         if server is None:
             return
@@ -2173,13 +2339,13 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "prune_plan_reviews",
-                "description": "Remove old completed local review records while keeping recent history.",
+                "description": "Remove old completed local review, clarification, and Session records while keeping recent history.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "keep_latest": {
                             "type": "integer",
-                            "description": "Always keep this many newest records.",
+                            "description": "Always keep this many newest records in each history category.",
                             "default": DEFAULT_HISTORY_KEEP_RECORDS,
                         },
                         "older_than_days": {
@@ -2189,7 +2355,7 @@ class PlanReviewerMcpServer:
                         },
                         "include_pending": {
                             "type": "boolean",
-                            "description": "Also allow removing pending records.",
+                            "description": "Also allow removing pending reviews, unanswered clarifications, and unfinished Sessions.",
                             "default": False,
                         },
                     },
@@ -2197,7 +2363,7 @@ class PlanReviewerMcpServer:
             },
             {
                 "name": "clear_plan_reviews",
-                "description": "Clear local review records. Requires confirm=true to avoid accidental deletion.",
+                "description": "Clear local review, clarification, and Session records. Requires confirm=true to avoid accidental deletion.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2208,7 +2374,7 @@ class PlanReviewerMcpServer:
                         },
                         "include_pending": {
                             "type": "boolean",
-                            "description": "Also delete pending records.",
+                            "description": "Also delete pending reviews, unanswered clarifications, and unfinished Sessions.",
                             "default": False,
                         },
                     },
@@ -2396,8 +2562,9 @@ class PlanReviewerMcpServer:
             timeout_seconds: 最大等待秒数。
 
         Returns:
-            当前 session 摘要。若用户已经提交新回答、批注或通过计划，`lastUserAction`
-            会包含可直接吸收的结构化内容。
+            当前 session 摘要。只有 `lastUserAction.seq > since_action_seq` 时，调用方才应
+            把 `lastUserAction` 当作新动作消费；超时或非阻塞检查仍会原样返回旧动作，便于
+            Codex 诊断当前状态。
         """
         bounded_timeout = max(0.0, min(timeout_seconds, 900.0))
         deadline = time.monotonic() + bounded_timeout
@@ -2405,8 +2572,7 @@ class PlanReviewerMcpServer:
             result = self._session_result(session_id)
             action = result.session.get("lastUserAction") or {}
             action_seq = int(action.get("seq") or 0)
-            session_status = result.session.get("status")
-            if action_seq > since_action_seq or (session_status in SESSION_USER_ACTION_STATUSES and action_seq > 0):
+            if action_seq > since_action_seq:
                 return result
             if timeout_seconds <= 0 or time.monotonic() >= deadline:
                 return result

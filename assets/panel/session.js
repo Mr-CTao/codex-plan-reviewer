@@ -650,9 +650,10 @@ function buildClarificationAnswer(item) {
   const selectedOption = options.find((option) => option.label === state.selectedLabel);
   const freeformAnswer = String(document.getElementById("sessionFreeformInput")?.value ?? "").trim();
   const usesFreeform = state.selectedLabel === FREEFORM_OPTION_LABEL || options.length === 0;
-  const finalAnswer = usesFreeform
-    ? freeformAnswer
-    : [selectedOption?.title, selectedOption?.description].filter(Boolean).join("\n");
+  const selectedAnswer = [selectedOption?.title, selectedOption?.description].filter(Boolean).join("\n");
+  // A/B/C 下的补充说明也是用户需求的一部分，必须进入 finalAnswer 供 Codex 直接消费。
+  const supplementAnswer = freeformAnswer ? `补充说明：${freeformAnswer}` : "";
+  const finalAnswer = usesFreeform ? freeformAnswer : [selectedAnswer, supplementAnswer].filter(Boolean).join("\n\n");
 
   return {
     selectedLabel: state.selectedLabel,

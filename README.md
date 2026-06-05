@@ -240,8 +240,8 @@ Windows 下对应路径通常是：
 
 可以通过 MCP 工具清理历史：
 
-- `prune_plan_reviews`：保留近期记录。
-- `clear_plan_reviews`：清空所有审阅记录，需要显式确认。
+- `prune_plan_reviews`：保留每类近期记录，并清理较旧且已完成的审阅、澄清和 Session；默认不会删除 pending/未完成 Session。
+- `clear_plan_reviews`：清空已完成的审阅、澄清和 Session，需要显式确认；如需连同 pending/未完成 Session 一并删除，传入 `include_pending: true`。
 
 ## MCP 工具缺失时
 
